@@ -11,14 +11,12 @@ let logs = [];
 
 function addLog(message) {
     const timestamp = new Date().toLocaleTimeString();
-    const entry = `[${timestamp}] ${message}`;
-    console.log(entry);
-    logs.unshift(entry);
+    logs.unshift(`[${timestamp}] ${message}`);
     if (logs.length > 50) logs.pop();
 }
 
 const s3Client = new S3Client({
-    endpoint: "https://s3.us-east-005.backblazeb2.com",
+    endpoint: "https://s3.us-east-005.backblazeb2.com", // Change if your region is different
     region: "us-east-005",
     credentials: {
         accessKeyId: process.env.B2_KEY_ID, 
@@ -35,79 +33,71 @@ async function uploadToB2(key, body, contentType) {
 }
 
 async function mirrorHLS(quality, url, videoId) {
-    addLog(`Processing ${quality}...`);
+    addLog(`🧹 Cleaning & Mirroring ${quality}...`);
     try {
         const playlistRes = await axios.get(url);
         const originalText = playlistRes.data;
 
-        // --- THE SKIPPING FIX ---
-        // We rewrite the playlist to use ONLY filenames.
-        // This makes VLC/Players attach the token to every segment automatically.
         const lines = originalText.split('\n');
-        const cleanedLines = lines.map(line => {
-            if (line.trim().endsWith('.ts') || line.includes('.ts?')) {
-                return line.split('?')[0].split('/').pop(); 
+        const cleanedLines = [];
+        const segmentsToDownload = [];
+
+        // --- AGGRESSIVE CLEANING ---
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) {
+                cleanedLines.push(trimmed);
+                continue;
             }
-            return line;
-        });
-        const fixedPlaylist = cleanedLines.join('\n');
+            // Strip everything except the filename (e.g. segment0.ts)
+            const fileNameOnly = trimmed.split('?')[0].split('/').pop();
+            cleanedLines.push(fileNameOnly);
 
-        await uploadToB2(`${videoId}/${quality}/index.m3u8`, fixedPlaylist, 'application/x-mpegURL');
-
-        // Download segments using original URLs
-        const segments = originalText.match(/.*\.ts/g);
-        if (segments) {
-            for (let i = 0; i < segments.length; i++) {
-                const segmentLine = segments[i];
-                const cleanFileName = segmentLine.split('?')[0].split('/').pop();
-                const segmentUrl = new URL(segmentLine, url).href;
-
-                const segmentStream = await axios({ method: 'get', url: segmentUrl, responseType: 'stream' });
-                await uploadToB2(`${videoId}/${quality}/${cleanFileName}`, segmentStream.data, 'video/MP2T');
-                
-                if (i % 10 === 0) addLog(`Progress ${quality}: ${i + 1}/${segments.length}`);
-            }
-            addLog(`✅ ${quality} Complete.`);
+            // Get the real download URL
+            const fullUrl = trimmed.startsWith('http') ? trimmed : new URL(trimmed, url).href;
+            segmentsToDownload.push({ name: fileNameOnly, url: fullUrl });
         }
-    } catch (err) {
-        addLog(`❌ Error in ${quality}: ${err.message}`);
-    }
+
+        // Upload Clean Playlist
+        await uploadToB2(`${videoId}/${quality}/index.m3u8`, cleanedLines.join('\n'), 'application/x-mpegURL');
+
+        // Download & Upload Segments (Parallel for Speed)
+        const CONCURRENCY = 5; 
+        for (let i = 0; i < segmentsToDownload.length; i += CONCURRENCY) {
+            const chunk = segmentsToDownload.slice(i, i + CONCURRENCY);
+            await Promise.all(chunk.map(async (seg) => {
+                const res = await axios({ method: 'get', url: seg.url, responseType: 'stream' });
+                await uploadToB2(`${videoId}/${quality}/${seg.name}`, res.data, 'video/MP2T');
+            }));
+            if (i % 20 === 0) addLog(`Progress ${quality}: ${i}/${segmentsToDownload.length}`);
+        }
+        addLog(`✅ ${quality} Mirror Finished.`);
+    } catch (err) { addLog(`❌ Error in ${quality}: ${err.message}`); }
 }
 
 async function createMasterPlaylist(videoData, videoId) {
-    addLog("Generating Master Playlist...");
     let master = "#EXTM3U\n#EXT-X-VERSION:3\n\n";
-    
     for (const quality of Object.keys(videoData.fast_stream_url)) {
         let res = quality === "1080p" ? "1920x1080" : quality === "720p" ? "1280x720" : "854x480";
-        let bw = quality === "1080p" ? "5000000" : quality === "720p" ? "2800000" : "1400000";
-        
-        master += `#EXT-X-STREAM-INF:BANDWIDTH=${bw},RESOLUTION=${res}\n`;
-        master += `${quality}/index.m3u8\n\n`; // Relative path to sub-playlist
+        master += `#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=${res}\n${quality}/index.m3u8\n\n`;
     }
-
     await uploadToB2(`${videoId}/master.m3u8`, master, 'application/x-mpegURL');
 }
 
 app.get('/', (req, res) => {
-    const logHtml = logs.map(l => `<div>${l}</div>`).join('');
-    res.send(`<html><body style="background:#121212;color:#0f0;font-family:monospace;padding:20px;">
-        <h2>B2 Mirror Live Logs</h2><meta http-equiv="refresh" content="5">
-        <div style="background:#000;padding:10px;height:450px;overflow-y:auto;border:1px solid #333;">${logHtml || "Waiting for task..."}</div>
+    res.send(`<html><body style="background:#000;color:#0f0;font-family:monospace;padding:20px;">
+        <h2>B2 Mirror Live Logs</h2><div style="border:1px solid #333;padding:10px;">${logs.map(l => `<div>${l}</div>`).join('')}</div>
     </body></html>`);
 });
 
 app.post('/mirror', async (req, res) => {
     const { videoData, videoId } = req.body;
-    res.json({ message: "Mirroring started", videoId });
-    
+    res.json({ message: "Started mirroring", videoId });
     (async () => {
-        for (const [quality, url] of Object.entries(videoData.fast_stream_url)) {
-            await mirrorHLS(quality, url, videoId);
-        }
+        for (const [q, url] of Object.entries(videoData.fast_stream_url)) { await mirrorHLS(q, url, videoId); }
         await createMasterPlaylist(videoData, videoId);
         addLog(`✨ ALL JOBS FINISHED: ${videoId}`);
     })();
 });
 
-app.listen(PORT, () => console.log(`Server on ${PORT}`));
+app.listen(PORT, () => console.log(`Mirror on ${PORT}`));
