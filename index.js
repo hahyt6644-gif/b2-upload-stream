@@ -10,13 +10,14 @@ const PORT = process.env.PORT || 3000;
 let logs = [];
 
 function addLog(message) {
-    const timestamp = new Date().toLocaleTimeString();
-    logs.unshift(`[${timestamp}] ${message}`);
+    const entry = `[${new Date().toLocaleTimeString()}] ${message}`;
+    logs.unshift(entry);
     if (logs.length > 50) logs.pop();
 }
 
+// MATCHES YOUR SCREENSHOT: us-east-005
 const s3Client = new S3Client({
-    endpoint: "https://s3.us-east-005.backblazeb2.com", // Change if your region is different
+    endpoint: "https://s3.us-east-005.backblazeb2.com",
     region: "us-east-005",
     credentials: {
         accessKeyId: process.env.B2_KEY_ID, 
@@ -42,26 +43,25 @@ async function mirrorHLS(quality, url, videoId) {
         const cleanedLines = [];
         const segmentsToDownload = [];
 
-        // --- AGGRESSIVE CLEANING ---
         for (const line of lines) {
             const trimmed = line.trim();
             if (!trimmed || trimmed.startsWith('#')) {
                 cleanedLines.push(trimmed);
                 continue;
             }
-            // Strip everything except the filename (e.g. segment0.ts)
+            // THE CLEANER: Strip everything except the filename
             const fileNameOnly = trimmed.split('?')[0].split('/').pop();
             cleanedLines.push(fileNameOnly);
 
-            // Get the real download URL
+            // Build original download URL
             const fullUrl = trimmed.startsWith('http') ? trimmed : new URL(trimmed, url).href;
             segmentsToDownload.push({ name: fileNameOnly, url: fullUrl });
         }
 
-        // Upload Clean Playlist
+        // Upload the Clean Playlist (No external links)
         await uploadToB2(`${videoId}/${quality}/index.m3u8`, cleanedLines.join('\n'), 'application/x-mpegURL');
 
-        // Download & Upload Segments (Parallel for Speed)
+        // Parallel Download/Upload for speed
         const CONCURRENCY = 5; 
         for (let i = 0; i < segmentsToDownload.length; i += CONCURRENCY) {
             const chunk = segmentsToDownload.slice(i, i + CONCURRENCY);
@@ -85,8 +85,8 @@ async function createMasterPlaylist(videoData, videoId) {
 }
 
 app.get('/', (req, res) => {
-    res.send(`<html><body style="background:#000;color:#0f0;font-family:monospace;padding:20px;">
-        <h2>B2 Mirror Live Logs</h2><div style="border:1px solid #333;padding:10px;">${logs.map(l => `<div>${l}</div>`).join('')}</div>
+    res.send(`<html><body style="background:#111;color:#0f0;font-family:monospace;padding:20px;">
+        <h2>B2 Mirror System Live Logs</h2><div style="border:1px solid #333;padding:10px;">${logs.map(l => `<div>${l}</div>`).join('')}</div>
     </body></html>`);
 });
 
@@ -100,4 +100,4 @@ app.post('/mirror', async (req, res) => {
     })();
 });
 
-app.listen(PORT, () => console.log(`Mirror on ${PORT}`));
+app.listen(PORT, () => console.log(`Mirror running on ${PORT}`));
