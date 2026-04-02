@@ -4,6 +4,8 @@ const { S3Client } = require("@aws-sdk/client-s3");
 const { Upload } = require("@aws-sdk/lib-storage");
 
 const app = express();
+app.use(express.json()); // Allows the server to read JSON bodies
+
 const PORT = process.env.PORT || 3000;
 
 // Initialize B2 Client
@@ -16,36 +18,62 @@ const s3Client = new S3Client({
     },
 });
 
-// Reusable upload function
 async function uploadToB2(key, body, contentType) {
     const upload = new Upload({
         client: s3Client,
-        params: { Bucket: "tera-stream-itz", Key: key, Body: body, ContentType: contentType },
+        params: { 
+            Bucket: "tera-stream-itz", 
+            Key: key, 
+            Body: body, 
+            ContentType: contentType 
+        },
     });
     return upload.done();
 }
 
-// The route that triggers the work
-app.get('/start-mirror', async (req, res) => {
-    res.send("Mirroring started in the background...");
+// The Core Logic
+async function mirrorHLS(quality, url, videoId) {
+    const playlistRes = await axios.get(url);
+    const playlistText = playlistRes.data;
 
-    // Your logic here
-    const videoData = { /* YOUR JSON */ };
-    const videoId = "Update_20231215";
+    await uploadToB2(`${videoId}/${quality}/index.m3u8`, playlistText, 'application/x-mpegURL');
 
+    const segments = playlistText.match(/.*\.ts/g);
+    if (segments) {
+        for (const segmentName of segments) {
+            const segmentUrl = new URL(segmentName, url).href;
+            const segmentStream = await axios({ method: 'get', url: segmentUrl, responseType: 'stream' });
+            await uploadToB2(`${videoId}/${quality}/${segmentName}`, segmentStream.data, 'video/MP2T');
+        }
+    }
+}
+
+// API ENDPOINT: POST /mirror
+app.post('/mirror', async (req, res) => {
+    const { videoData, videoId } = req.body;
+
+    if (!videoData || !videoId) {
+        return res.status(400).json({ error: "Missing videoData or videoId in JSON body" });
+    }
+
+    // Respond immediately so the request doesn't timeout
+    res.json({ message: "Mirroring process started in background", videoId });
+
+    // Run the processing in the background
     try {
         for (const [quality, url] of Object.entries(videoData.fast_stream_url)) {
-            // ... (Your mirrorHLS logic)
+            console.log(`Starting ${quality} for ${videoId}`);
+            await mirrorHLS(quality, url, videoId);
         }
-        console.log("✅ Mirroring Complete!");
+        console.log(`✅ All qualities mirrored for ${videoId}`);
     } catch (err) {
-        console.error("❌ Error:", err);
+        console.error("❌ Mirroring failed:", err.message);
     }
 });
 
-// Basic health check so Render knows the app is alive
-app.get('/', (req, res) => res.send('Server is running!'));
+// Health check for Render
+app.get('/', (req, res) => res.send('HLS Mirror Server is Online'));
 
 app.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
