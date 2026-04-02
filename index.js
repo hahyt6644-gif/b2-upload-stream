@@ -7,15 +7,14 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-let logs = []; // Simple array to store recent logs for the web view
+let logs = [];
 
-// Helper to push logs to our web console
 function addLog(message) {
     const timestamp = new Date().toLocaleTimeString();
     const entry = `[${timestamp}] ${message}`;
     console.log(entry);
-    logs.unshift(entry); // Add to start of array
-    if (logs.length > 50) logs.pop(); // Keep only last 50 logs
+    logs.unshift(entry);
+    if (logs.length > 50) logs.pop();
 }
 
 const s3Client = new S3Client({
@@ -30,84 +29,93 @@ const s3Client = new S3Client({
 async function uploadToB2(key, body, contentType) {
     const upload = new Upload({
         client: s3Client,
-        params: { 
-            Bucket: "tera-stream-itz", 
-            Key: key, 
-            Body: body, 
-            ContentType: contentType 
-        },
+        params: { Bucket: "tera-stream-itz", Key: key, Body: body, ContentType: contentType },
     });
     return upload.done();
 }
 
 async function mirrorHLS(quality, url, videoId) {
-    addLog(`Starting ${quality} download...`);
+    addLog(`Processing ${quality}...`);
     try {
         const playlistRes = await axios.get(url);
-        const playlistText = playlistRes.data;
+        let playlistText = playlistRes.data;
 
-        // Upload index file
-        await uploadToB2(`${videoId}/${quality}/index.m3u8`, playlistText, 'application/x-mpegURL');
-        addLog(`Uploaded ${quality}/index.m3u8`);
+        // --- SKIPPING FIX (Relative Paths) ---
+        // This removes the long URLs from the index file so VLC keeps your token
+        const lines = playlistText.split('\n');
+        const cleanedLines = lines.map(line => {
+            if (line.trim().endsWith('.ts') || line.includes('.ts?')) {
+                return line.split('?')[0].split('/').pop();
+            }
+            return line;
+        });
+        const cleanedPlaylist = cleanedLines.join('\n');
 
+        await uploadToB2(`${videoId}/${quality}/index.m3u8`, cleanedPlaylist, 'application/x-mpegURL');
+
+        // Identify segments for downloading
         const segments = playlistText.match(/.*\.ts/g);
         if (segments) {
             addLog(`Found ${segments.length} segments for ${quality}`);
             for (let i = 0; i < segments.length; i++) {
                 const segmentLine = segments[i];
-                // FIX: Strip tokens from filename to avoid "1024 bytes" error
                 const cleanFileName = segmentLine.split('?')[0].split('/').pop();
                 const segmentUrl = new URL(segmentLine, url).href;
 
                 const segmentStream = await axios({ method: 'get', url: segmentUrl, responseType: 'stream' });
                 await uploadToB2(`${videoId}/${quality}/${cleanFileName}`, segmentStream.data, 'video/MP2T');
                 
-                if (i % 5 === 0) addLog(`Progress ${quality}: ${i + 1}/${segments.length}`);
+                if (i % 10 === 0) addLog(`Progress ${quality}: ${i + 1}/${segments.length}`);
             }
-            addLog(`✅ ${quality} Complete!`);
+            addLog(`✅ ${quality} Mirrored.`);
         }
     } catch (err) {
         addLog(`❌ Error in ${quality}: ${err.message}`);
     }
 }
 
-// WEB CONSOLE PAGE
+// Function to create a Master Playlist (.m3u8)
+async function createMasterPlaylist(videoData, videoId) {
+    addLog("Generating Master Playlist...");
+    let masterContent = "#EXTM3U\n#EXT-X-VERSION:3\n\n";
+
+    for (const [quality, url] of Object.entries(videoData.fast_stream_url)) {
+        let bandwidth = "800000"; // Default
+        let resolution = "640x360";
+
+        if (quality === "480p") { bandwidth = "1400000"; resolution = "854x480"; }
+        if (quality === "720p") { bandwidth = "2800000"; resolution = "1280x720"; }
+        if (quality === "1080p") { bandwidth = "5000000"; resolution = "1920x1080"; }
+
+        masterContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resolution}\n`;
+        masterContent += `${quality}/index.m3u8\n\n`;
+    }
+
+    await uploadToB2(`${videoId}/master.m3u8`, masterContent, 'application/x-mpegURL');
+    addLog("🏁 Master Playlist uploaded!");
+}
+
 app.get('/', (req, res) => {
     const logHtml = logs.map(l => `<div>${l}</div>`).join('');
-    res.send(`
-        <html>
-            <head>
-                <title>B2 Mirror Console</title>
-                <meta http-equiv="refresh" content="5">
-                <style>
-                    body { background: #121212; color: #00ff00; font-family: monospace; padding: 20px; }
-                    h2 { color: #fff; }
-                    .console { border: 1px solid #333; padding: 10px; height: 400px; overflow-y: auto; background: #000; }
-                </style>
-            </head>
-            <body>
-                <h2>B2 Stream Mirror - Live Logs</h2>
-                <p>Status: Online | Auto-refreshing every 5s</p>
-                <div class="console">${logHtml || "Waiting for logs..." }</div>
-            </body>
-        </html>
-    `);
+    res.send(`<html><body style="background:#121212;color:#0f0;font-family:monospace;padding:20px;">
+        <h2>B2 Mirror Console</h2><meta http-equiv="refresh" content="5">
+        <div style="background:#000;padding:10px;height:450px;overflow-y:auto;border:1px solid #333;">${logHtml || "System Ready..."}</div>
+    </body></html>`);
 });
 
-// API ENDPOINT
 app.post('/mirror', async (req, res) => {
     const { videoData, videoId } = req.body;
-    if (!videoData || !videoId) return res.status(400).json({ error: "Missing data" });
+    if (!videoData || !videoId) return res.status(400).json({ error: "Invalid payload" });
 
-    res.json({ message: "Mirroring started in background", videoId });
+    res.json({ message: "Task started", videoId });
 
-    // Processing in background
     (async () => {
         for (const [quality, url] of Object.entries(videoData.fast_stream_url)) {
             await mirrorHLS(quality, url, videoId);
         }
-        addLog(`🏁 ALL JOBS FINISHED FOR ${videoId}`);
+        await createMasterPlaylist(videoData, videoId);
+        addLog(`✨ ALL DONE: ${videoId}`);
     })();
 });
 
-app.listen(PORT, () => addLog(`Server started on port ${PORT}`));
+app.listen(PORT, () => addLog(`Server live on port ${PORT}`));
